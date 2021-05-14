@@ -1,5 +1,5 @@
 #!/usr/bin/env python
-"""Train models."""
+"""Train APE models."""
 import os
 import signal
 import torch
@@ -9,20 +9,22 @@ import onmt.utils.distributed
 
 from onmt.utils.misc import set_random_seed
 from onmt.utils.logging import init_logger, logger
-from onmt.train_single import main as single_main
-from onmt.utils.parse import ArgumentParser
-from onmt.inputters.inputter import build_dataset_iter, \
+from onmt.modules.ape.train_single import main as single_main
+from onmt.modules.ape.utils.parse import ArgumentParserForAPE
+from onmt.modules.ape.inputters.inputter import build_dataset_iter, \
     load_old_vocab, old_style_vocab, build_dataset_iter_multiple
 
 from itertools import cycle
-import onmt.modules.ape.opts as ape_opts
-from onmt.modules.ape.bin.train import train as ape_train
+# for type hints and annotation
+from argparse import Namespace
+from torch.multiprocessing import Queue, Semaphore
+from typing import List
 
 
-def train(opt):
-    ArgumentParser.validate_train_opts(opt)
-    ArgumentParser.update_model_opts(opt)
-    ArgumentParser.validate_model_opts(opt)
+def train(opt: Namespace):
+    ArgumentParserForAPE.validate_train_opts(opt)
+    ArgumentParserForAPE.update_model_opts(opt)
+    ArgumentParserForAPE.validate_model_opts(opt)
 
     set_random_seed(opt.seed, False)
 
@@ -65,7 +67,7 @@ def train(opt):
         semaphore = mp.Semaphore(opt.world_size * opt.queue_size)
         # Create a thread to listen for errors in the child processes.
         error_queue = mp.SimpleQueue()
-        error_handler = ErrorHandler(error_queue)
+        error_handler = onmt.bin.train.ErrorHandler(error_queue)
         # Train with multiprocessing.
         procs = []
         for device_id in range(nb_gpu):
@@ -92,7 +94,11 @@ def train(opt):
         single_main(opt, -1)
 
 
-def batch_producer(generator_to_serve, queues, semaphore, opt):
+def batch_producer(
+    generator_to_serve,
+    queues: List[Queue],
+    semaphore: Semaphore,
+    opt: Namespace):
     init_logger(opt.log_file)
     set_random_seed(opt.seed, False)
     # generator_to_serve = iter(generator_to_serve)
@@ -123,12 +129,17 @@ def batch_producer(generator_to_serve, queues, semaphore, opt):
                            for _ in b.src])
         else:
             b.src = b.src.to(torch.device(device_id))
-        b.tgt = b.tgt.to(torch.device(device_id))
+        if isinstance(b.mt, tuple):
+            b.mt = tuple([_.to(torch.device(device_id))
+                          for _ in b.mt])
+        else:
+            b.mt = b.mt.to(torch.device(device_id))
+        b.pe = b.pe.to(torch.device(device_id))
         b.indices = b.indices.to(torch.device(device_id))
         b.alignment = b.alignment.to(torch.device(device_id)) \
             if hasattr(b, 'alignment') else None
-        b.src_map = b.src_map.to(torch.device(device_id)) \
-            if hasattr(b, 'src_map') else None
+        b.mt_map = b.mt_map.to(torch.device(device_id)) \
+            if hasattr(b, "mt_map") else None
         b.align = b.align.to(torch.device(device_id)) \
             if hasattr(b, 'align') else None
         b.corpus_id = b.corpus_id.to(torch.device(device_id)) \
@@ -154,64 +165,3 @@ def run(opt, device_id, error_queue, batch_queue, semaphore):
         # propagate exception to parent process, keeping original traceback
         import traceback
         error_queue.put((opt.gpu_ranks[device_id], traceback.format_exc()))
-
-
-class ErrorHandler(object):
-    """A class that listens for exceptions in children processes and propagates
-    the tracebacks to the parent process."""
-
-    def __init__(self, error_queue):
-        """ init error handler """
-        import signal
-        import threading
-        self.error_queue = error_queue
-        self.children_pids = []
-        self.error_thread = threading.Thread(
-            target=self.error_listener, daemon=True)
-        self.error_thread.start()
-        signal.signal(signal.SIGUSR1, self.signal_handler)
-
-    def add_child(self, pid):
-        """ error handler """
-        self.children_pids.append(pid)
-
-    def error_listener(self):
-        """ error listener """
-        (rank, original_trace) = self.error_queue.get()
-        self.error_queue.put((rank, original_trace))
-        os.kill(os.getpid(), signal.SIGUSR1)
-
-    def signal_handler(self, signalnum, stackframe):
-        """ signal handler """
-        for pid in self.children_pids:
-            os.kill(pid, signal.SIGINT)  # kill children processes
-        (rank, original_trace) = self.error_queue.get()
-        msg = """\n\n-- Tracebacks above this line can probably
-                 be ignored --\n\n"""
-        msg += original_trace
-        raise Exception(msg)
-
-
-def _get_parser():
-    parser = ArgumentParser(description='train.py')
-
-    opts.config_opts(parser)
-    opts.model_opts(parser)
-    opts.train_opts(parser)
-    ape_opts.model_opts(parser)
-    ape_opts.train_opts(parser)
-    return parser
-
-
-def main():
-    parser = _get_parser()
-
-    opt = parser.parse_args()
-    if opt.ape == False:
-        train(opt)
-    else:
-        ape_train(opt)
-
-
-if __name__ == "__main__":
-    main()
