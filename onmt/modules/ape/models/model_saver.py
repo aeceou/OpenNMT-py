@@ -87,7 +87,8 @@ class ModelSaverBaseForAPE(ModelSaverBase):
                 is_top = chkpt_inf < self.checkpoint_queue[0][1]
             else:
                 is_top = True
-            if is_top:
+            if is_top or (not is_top and len(self.checkpoint_queue) \
+                          < self.checkpoint_queue.maxlen):
                 chkpt, chkpt_name = self._save(step, save_model, stat=stat)
                 self.last_saved_step = step
         else:
@@ -110,7 +111,8 @@ class ModelSaverBaseForAPE(ModelSaverBase):
                    and is_top:
                     todel = self.checkpoint_queue.popleft()[0]
                     self._rm_checkpoint(todel)
-                self.checkpoint_queue.append((chkpt_name, chkpt_inf))
+                if self.last_saved_step == step:
+                    self.checkpoint_queue.append((chkpt_name, chkpt_inf))
 
         if self.saving_cycle != None:
             if step % self.saving_cycle == 0:
